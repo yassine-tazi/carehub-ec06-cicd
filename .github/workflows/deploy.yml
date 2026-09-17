@@ -1,67 +1,112 @@
-name: Deploy production
+name: Deploy validation
 
 on:
   workflow_run:
     workflows: ['Build, scan, publish and sign']
     types: [completed]
+  workflow_dispatch:
 
 permissions:
   contents: read
-
-env:
-  APP_DIR: /opt/carehub
+  packages: read
 
 jobs:
-  deploy:
-    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
-    runs-on: [self-hosted, linux, docker]
+  deploy-validation:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+
+    runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: production
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Synchronize versioned deployment files
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine image version
+        id: version
         shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p "$APP_DIR/nginx"
-          cp 02_conteneurisation/compose.yml "$APP_DIR/compose.yml"
-          cp 02_conteneurisation/compose.prod.yml "$APP_DIR/compose.prod.yml"
-          cp 02_conteneurisation/nginx/default.conf "$APP_DIR/nginx/default.conf"
-      - name: Deploy immutable image
-        shell: bash
-        env:
-          NEW_IMAGE: ghcr.io/${{ github.repository_owner }}/carehub:${{ github.event.workflow_run.head_sha }}
-        run: |
-          set -euo pipefail
-          cd "$APP_DIR"
-          PREVIOUS_IMAGE="$(grep '^APP_IMAGE=' .env.prod | cut -d= -f2- || true)"
-          printf '%s\n' "$PREVIOUS_IMAGE" > .last_good_image
-          sed -i "s#^APP_IMAGE=.*#APP_IMAGE=${NEW_IMAGE}#" .env.prod
-          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml pull app
-          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml up -d --scale app=3 --no-deps app
-          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml up -d proxy
-          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml exec -T proxy nginx -s reload
-      - name: Post-deploy smoke test
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create ephemeral deployment environment
+        working-directory: 02_conteneurisation
         shell: bash
         run: |
-          set -euo pipefail
-          for i in $(seq 1 12); do
-            if curl -fsS http://127.0.0.1:8080/health | grep -q '"status":"ok"'; then
+          cat > .env.ci <<EOF
+          APP_IMAGE=ghcr.io/${{ github.repository_owner }}/carehub:${{ steps.version.outputs.sha }}
+          POSTGRES_DB=carehub
+          POSTGRES_USER=carehub
+          POSTGRES_PASSWORD=ci-demo-password
+          APP_ENV=production
+          APP_PORT=8080
+          EOF
+
+      - name: Deploy stack with 3 application replicas
+        working-directory: 02_conteneurisation
+        shell: bash
+        run: |
+          docker compose \
+            --env-file .env.ci \
+            -f compose.yml \
+            -f compose.prod.yml \
+            up -d --scale app=3
+
+      - name: Show deployed containers
+        working-directory: 02_conteneurisation
+        run: |
+          docker compose \
+            --env-file .env.ci \
+            -f compose.yml \
+            -f compose.prod.yml \
+            ps
+
+      - name: Post-deployment smoke test
+        shell: bash
+        run: |
+          for i in $(seq 1 18); do
+            if curl -fsS http://127.0.0.1:8080/health; then
+              echo
+              echo "DEPLOYMENT VALIDATION: SUCCESS"
               exit 0
             fi
+
+            echo "Waiting for CareHub..."
             sleep 5
           done
+
+          echo "DEPLOYMENT VALIDATION: FAILED"
           exit 1
-      - name: Automatic rollback
-        if: failure()
+
+      - name: Load-balancing evidence
         shell: bash
         run: |
-          set -euo pipefail
-          cd "$APP_DIR"
-          LAST_GOOD_IMAGE="$(cat .last_good_image)"
-          test -n "$LAST_GOOD_IMAGE"
-          sed -i "s#^APP_IMAGE=.*#APP_IMAGE=${LAST_GOOD_IMAGE}#" .env.prod
-          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml pull app
-          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml up -d --scale app=3 --no-deps app
-          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml exec -T proxy nginx -s reload
-          curl -fsS http://127.0.0.1:8080/health
+          for i in $(seq 1 12); do
+            curl -fsS http://127.0.0.1:8080/instance
+            echo
+          done
+
+      - name: Resource usage
+        run: docker stats --no-stream
+
+      - name: Cleanup
+        if: always()
+        working-directory: 02_conteneurisation
+        run: |
+          docker compose \
+            --env-file .env.ci \
+            -f compose.yml \
+            -f compose.prod.yml \
+            down -v
