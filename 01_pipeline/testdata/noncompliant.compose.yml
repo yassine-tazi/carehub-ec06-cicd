@@ -1,0 +1,6 @@
+services:
+  app:
+    image: example/carehub:latest
+    privileged: true
+    environment:
+      API_TOKEN: fake-inline-value-for-test-only

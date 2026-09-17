@@ -1,0 +1,8 @@
+services:
+  app:
+    build: null
+    image: ${APP_IMAGE:?APP_IMAGE must be an immutable registry tag in production}
+  db:
+    restart: always
+  proxy:
+    restart: always

@@ -1,0 +1,67 @@
+name: Deploy production
+
+on:
+  workflow_run:
+    workflows: ['Build, scan, publish and sign']
+    types: [completed]
+
+permissions:
+  contents: read
+
+env:
+  APP_DIR: /opt/carehub
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: [self-hosted, linux, docker]
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Synchronize versioned deployment files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$APP_DIR/nginx"
+          cp 02_conteneurisation/compose.yml "$APP_DIR/compose.yml"
+          cp 02_conteneurisation/compose.prod.yml "$APP_DIR/compose.prod.yml"
+          cp 02_conteneurisation/nginx/default.conf "$APP_DIR/nginx/default.conf"
+      - name: Deploy immutable image
+        shell: bash
+        env:
+          NEW_IMAGE: ghcr.io/${{ github.repository_owner }}/carehub:${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          PREVIOUS_IMAGE="$(grep '^APP_IMAGE=' .env.prod | cut -d= -f2- || true)"
+          printf '%s\n' "$PREVIOUS_IMAGE" > .last_good_image
+          sed -i "s#^APP_IMAGE=.*#APP_IMAGE=${NEW_IMAGE}#" .env.prod
+          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml pull app
+          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml up -d --scale app=3 --no-deps app
+          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml up -d proxy
+          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml exec -T proxy nginx -s reload
+      - name: Post-deploy smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 12); do
+            if curl -fsS http://127.0.0.1:8080/health | grep -q '"status":"ok"'; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
+      - name: Automatic rollback
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          LAST_GOOD_IMAGE="$(cat .last_good_image)"
+          test -n "$LAST_GOOD_IMAGE"
+          sed -i "s#^APP_IMAGE=.*#APP_IMAGE=${LAST_GOOD_IMAGE}#" .env.prod
+          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml pull app
+          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml up -d --scale app=3 --no-deps app
+          docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml exec -T proxy nginx -s reload
+          curl -fsS http://127.0.0.1:8080/health
